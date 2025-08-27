@@ -1,0 +1,2 @@
+1- it asks for assistive access and shows error -25211 (if the app doesn't have that permission) on the app that I'm using it on. It shoudl not ask for that in first place. 
+2- it asks for a permssion wich is controling your computer for the app that you are using it with. Chat GPT said the issue was with sth related to the shortcut that is running that but I don't think so.
