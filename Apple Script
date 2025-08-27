@@ -1,0 +1,274 @@
+use AppleScript version "2.8"
+use framework "Foundation"
+use framework "AppKit"
+use scripting additions
+
+property autoSend : false -- press Return after pasting?
+property twoPasteMode : true -- paste image, then text (safer)
+property includeExcerpt : true -- include the text you copied before running
+property maxExcerptChars : 800 -- trim very long clipboards
+property autoClearSeconds : 5 -- after run, wait this many seconds, then clear clipboard (0 = disable)
+
+on run
+	try
+		-- 1) Previously copied text (EXCERPT)
+		set excerptText to my readClipboardText()
+		
+		-- 2) If ChatGPT Quick Ask is frontmost, hide it so we capture the real app
+		set frontName to my frontmostProcessName()
+		set quickAskWasShowing to false
+		if frontName is "ChatGPT" then
+			-- only hide if it's the tiny Quick Ask panel, not the full app window
+			if my isQuickAskOpen() then
+				set quickAskWasShowing to true
+				my toggleQuickAsk()
+				delay 0.2
+			end if
+		end if
+		
+		-- 3) Screenshot the frontmost app’s front window to the clipboard (no shadow)
+		-- use pixel-accurate rect to avoid Retina cropping
+		set {xPos, yPos, wSize, hSize} to my frontWindowRectPixels()
+		do shell script "screencapture -c -o -R" & xPos & "," & yPos & "," & wSize & "," & hSize
+		delay 0.25
+		
+		-- 4) Build final text (no SHORT ANSWER header)
+		set finalText to my buildFinalText(excerptText)
+		
+		-- 5) Get PNG bytes for reliable image pasting
+		set {pngData, theImage} to my pngDataFromClipboardImage()
+		if pngData is missing value then error "No image on clipboard after screencapture."
+		
+		-- 6) Open Quick Ask and paste (NO Space switching)
+		-- Re-open Mini (⌥Space) on the CURRENT Space, focus input WITHOUT activating app/Space
+		set gotFocus to false
+		with timeout of 6 seconds
+			my toggleQuickAsk()
+			delay 0.35
+			set gotFocus to my focusQuickAskNoActivate()
+		end timeout
+		if (gotFocus is false) then
+			-- gentle nudge: Tab usually lands in the input without activating Spaces
+			tell application "System Events" to key code 48 -- Tab
+			delay 0.05
+		end if
+		
+		if twoPasteMode then
+			-- paste image first
+			my writePNGOnlyToClipboard(pngData)
+			tell application "System Events" to keystroke "v" using {command down}
+			delay 0.25
+			-- then paste text
+			my writePlainTextOnlyToClipboard(finalText)
+			tell application "System Events"
+				keystroke "v" using {command down}
+				if autoSend then keystroke return
+			end tell
+		else
+			-- single mixed paste (less reliable in some fields)
+			my writeImageAndTextOneItem(theImage, finalText)
+			tell application "System Events"
+				keystroke "v" using {command down}
+				if autoSend then keystroke return
+			end tell
+		end if
+		
+		-- avoid saving Obj-C pointers
+		set theImage to missing value
+		set pngData to missing value
+		
+	on error e number n
+		-- always schedule clipboard cleanup even if the user cancels
+		if autoClearSeconds > 0 then my delayedClearClipboard(autoClearSeconds)
+		if n is -128 then return -- user canceled
+		display alert "Error " & n message e as warning
+	end try
+	
+	-- normal path: schedule clipboard cleanup
+	if autoClearSeconds > 0 then my delayedClearClipboard(autoClearSeconds)
+end run
+
+-- ===== helpers =====
+
+on buildFinalText(ex)
+	set lf to linefeed
+	set base to "" -- removed the SHORT ANSWER header entirely
+	if includeExcerpt and ex is not "" then
+		set exTrim to my trimExcerpt(ex, maxExcerptChars)
+		set base to "from my clipboard:" & lf & "-----" & lf & exTrim & lf & "-----" & lf
+	end if
+	set instructionText to "please respond in short. this part that you can see being pasted here the " & quote & "the thing that from my clipboard if I have provided you with otherwise you can find it on image" & quote & " is the one the person asking wants to know either its meaning both in this concept of the image that you can see and also he wants to know the overall meaning of that. so also if applicable give that person some pro tips about things that you can see. please make your response short."
+	return base & instructionText
+end buildFinalText
+
+on trimExcerpt(t, maxLen)
+	if (length of t) ≤ maxLen then return t
+	return (text 1 thru maxLen of t) & "..."
+end trimExcerpt
+
+on frontmostProcessName()
+	tell application "System Events"
+		set p to first process whose frontmost is true
+		return name of p
+	end tell
+end frontmostProcessName
+
+on toggleQuickAsk()
+	tell application "System Events" to keystroke space using {option down}
+end toggleQuickAsk
+
+on frontWindowRect()
+	tell application "System Events"
+		set p to first process whose frontmost is true
+		if (count of windows of p) = 0 then error "No visible window in the front app."
+		tell p
+			set {xPos, yPos} to position of window 1
+			set {wSize, hSize} to size of window 1
+		end tell
+	end tell
+	return {xPos, yPos, wSize, hSize}
+end frontWindowRect
+
+-- Pixel-accurate rect for Retina (screencapture -R expects pixels, not points)
+on frontWindowRectPixels()
+	set {xPos, yPos, wSize, hSize} to my frontWindowRect()
+	set scale to 1.0
+	try
+		set scale to (current application's NSScreen's mainScreen()'s backingScaleFactor()) as real
+	end try
+	set xP to (round (xPos * scale))
+	set yP to (round (yPos * scale))
+	set wP to (round (wSize * scale))
+	set hP to (round (hSize * scale))
+	return {xP, yP, wP, hP}
+end frontWindowRectPixels
+
+-- Heuristic to detect if the tiny Quick Ask window is what’s frontmost
+on isQuickAskOpen()
+	tell application "System Events"
+		set p to first process whose frontmost is true
+		if name of p is not "ChatGPT" then return false
+		if (count of windows of p) = 0 then return false
+		tell p to tell window 1
+			set {wSize, hSize} to size
+		end tell
+	end tell
+	-- Quick Ask is small compared to the full app; tweak thresholds if needed
+	return (wSize ≤ 900 and hSize ≤ 700)
+end isQuickAskOpen
+
+-- NEW: Focus Quick Ask input WITHOUT activating ChatGPT (prevents Space switching)
+on focusQuickAskNoActivate()
+	tell application "System Events"
+		if not (exists process "ChatGPT") then return false
+		tell process "ChatGPT"
+			try
+				if (exists window 1) then
+					tell window 1
+						if (exists text area 1) then
+							set focused of text area 1 to true
+							return true
+						else if (exists scroll area 1) then
+							tell scroll area 1
+								if (exists text area 1) then
+									set focused of text area 1 to true
+									return true
+								end if
+							end tell
+						end if
+					end tell
+				end if
+			end try
+		end tell
+	end tell
+	return false
+end focusQuickAskNoActivate
+
+-- (Original helper retained but unused)
+on openAndFocusQuickAsk()
+	tell application "System Events"
+		tell process "ChatGPT"
+			-- NOTE: we no longer call this because 'frontmost true' can switch Spaces.
+			set frontmost to true
+			delay 0.05
+			try
+				if (exists window 1) then
+					tell window 1
+						if (exists text area 1) then
+							set focused of text area 1 to true
+						else if (exists scroll area 1) then
+							tell scroll area 1
+								if (exists text area 1) then set focused of text area 1 to true
+							end tell
+						else
+							key code 48 -- Tab
+						end if
+					end tell
+				end if
+			end try
+		end tell
+	end tell
+end openAndFocusQuickAsk
+
+on readClipboardText()
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set s to pb's stringForType:"public.utf8-plain-text"
+	if s = missing value then return ""
+	return (s as text)
+end readClipboardText
+
+on pngDataFromClipboardImage()
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set theImage to (current application's NSImage's alloc()'s initWithPasteboard:pb)
+	if theImage = missing value then return {missing value, missing value}
+	if ((theImage's isValid()) as boolean) is false then return {missing value, missing value}
+	set tiffData to theImage's TIFFRepresentation()
+	if tiffData = missing value then return {missing value, missing value}
+	set rep to (current application's NSBitmapImageRep's imageRepWithData:tiffData)
+	if rep = missing value then return {missing value, missing value}
+	set emptyDict to current application's NSDictionary's dictionary()
+	set pngData to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:emptyDict
+	return {pngData, theImage}
+end pngDataFromClipboardImage
+
+on writePNGOnlyToClipboard(pngData)
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set pbItem to (current application's NSPasteboardItem's alloc()'s init())
+	pbItem's setData:pngData forType:"public.png"
+	pb's clearContents()
+	pb's writeObjects:(current application's NSArray's arrayWithObject:pbItem)
+end writePNGOnlyToClipboard
+
+on writePlainTextOnlyToClipboard(theText)
+	set pb to current application's NSPasteboard's generalPasteboard()
+	pb's clearContents()
+	set nsText to (current application's NSString's stringWithString:theText)
+	pb's setString:nsText forType:"public.utf8-plain-text"
+end writePlainTextOnlyToClipboard
+
+on writeImageAndTextOneItem(theImage, theText)
+	set pb to current application's NSPasteboard's generalPasteboard()
+	set tiffData to theImage's TIFFRepresentation()
+	set pbItem to (current application's NSPasteboardItem's alloc()'s init())
+	pbItem's setData:tiffData forType:"public.tiff"
+	set rep to (current application's NSBitmapImageRep's imageRepWithData:tiffData)
+	if rep is not missing value then
+		set pngData to rep's representationUsingType:(current application's NSBitmapImageFileTypePNG) |properties|:(current application's NSDictionary's dictionary())
+		if pngData is not missing value then pbItem's setData:pngData forType:"public.png"
+	end if
+	set nsText to (current application's NSString's stringWithString:theText)
+	pbItem's setString:nsText forType:"public.utf8-plain-text"
+	pb's clearContents()
+	pb's writeObjects:(current application's NSArray's arrayWithObject:pbItem)
+end writeImageAndTextOneItem
+
+-- Delay N seconds, then clear the clipboard
+on delayedClearClipboard(sec)
+	try
+		delay sec
+		set pb to current application's NSPasteboard's generalPasteboard()
+		pb's clearContents()
+		-- To force a truly blank string, you could also:
+		-- pb's setString:(current application's NSString's stringWithString:"") forType:"public.utf8-plain-text"
+	end try
+end delayedClearClipboard
